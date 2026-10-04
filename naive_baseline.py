@@ -40,7 +40,8 @@ def main():
 
     from config import OPENAI_API_KEY
     llm_client = None
-    if OPENAI_API_KEY:
+    offline = os.getenv("RAG_OFFLINE", "").lower() in {"1", "true", "yes"}
+    if OPENAI_API_KEY and not offline:
         from openai import OpenAI
         llm_client = OpenAI()
 

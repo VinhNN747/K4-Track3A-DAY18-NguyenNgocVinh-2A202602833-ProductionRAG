@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-"""Module 3: Reranking — Cross-encoder top-20 → top-3 + latency benchmark."""
+"""Module 3: cross-encoder reranking of hybrid-search candidates."""
 
-import os, sys, time
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
-from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import RERANK_TOP_K
@@ -26,63 +30,95 @@ class CrossEncoderReranker:
     def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
         self.model_name = model_name
         self._model = None
+        self._model_load_attempted = False
 
     def _load_model(self):
-        if self._model is None:
-            # TODO: Load cross-encoder model
-            # from sentence_transformers import CrossEncoder
-            # self._model = CrossEncoder(self.model_name)
-            #
-            # ⚠️ LƯU Ý: Dùng sentence_transformers.CrossEncoder, KHÔNG dùng FlagEmbedding.
-            # FlagReranker crash với transformers>=5.0 (XLMRobertaTokenizer lỗi).
-            pass
+        """Load the multilingual BGE cross encoder once per reranker instance."""
+        if self._model is None and not self._model_load_attempted:
+            self._model_load_attempted = True
+            if os.getenv("RAG_OFFLINE", "").lower() in {"1", "true", "yes"}:
+                raise RuntimeError("offline mode")
+            from sentence_transformers import CrossEncoder
+            self._model = CrossEncoder(self.model_name)
         return self._model
 
+    @staticmethod
+    def _fallback_scores(query: str, documents: list[dict]) -> list[float]:
+        """A deterministic offline fallback; production uses the cross encoder."""
+        query_terms = set(re.findall(r"[\wÀ-ỹ]+", query.lower(), flags=re.UNICODE))
+        scores = []
+        for document in documents:
+            terms = set(re.findall(r"[\wÀ-ỹ]+", document.get("text", "").lower(), flags=re.UNICODE))
+            overlap = len(query_terms & terms) / max(len(query_terms), 1)
+            scores.append(overlap + float(document.get("score", 0.0)) * 0.001)
+        return scores
+
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
-        """Rerank documents: top-20 → top-k."""
-        # TODO: Implement reranking
-        # 1. if not documents: return []
-        # 2. model = self._load_model()
-        # 3. pairs = [(query, doc["text"]) for doc in documents]
-        # 4. scores = model.predict(pairs)
-        # 5. if isinstance(scores, (int, float)): scores = [scores]
-        # 6. scored = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
-        # 7. Return [RerankResult(text=..., original_score=doc.get("score", 0.0),
-        #            rerank_score=float(score), metadata=..., rank=i)
-        #            for i, (score, doc) in enumerate(scored[:top_k])]
-        return []
+        """Score query-document pairs, sort descending, and return only ``top_k``."""
+        if not documents or top_k <= 0:
+            return []
+        try:
+            model = self._load_model()
+            scores = (model.predict([(query, document.get("text", "")) for document in documents])
+                      if model is not None else self._fallback_scores(query, documents))
+        except Exception as exc:
+            print(f"  Cross-encoder unavailable; using lexical fallback ({exc})")
+            scores = self._fallback_scores(query, documents)
+        if isinstance(scores, (int, float)):
+            scores = [scores]
+        ranked = sorted(zip(scores, documents), key=lambda item: float(item[0]), reverse=True)
+        return [
+            RerankResult(
+                text=document.get("text", ""),
+                original_score=float(document.get("score", 0.0)),
+                rerank_score=float(score),
+                metadata=dict(document.get("metadata", {})),
+                rank=rank,
+            )
+            for rank, (score, document) in enumerate(ranked[:top_k])
+        ]
 
 
 class FlashrankReranker:
-    """Lightweight alternative (<5ms). Optional."""
+    """Optional low-latency reranker that shares the same return type."""
+
     def __init__(self):
         self._model = None
 
     def rerank(self, query: str, documents: list[dict], top_k: int = RERANK_TOP_K) -> list[RerankResult]:
-        # TODO (optional): from flashrank import Ranker, RerankRequest
-        # model = Ranker(); passages = [{"text": d["text"]} for d in documents]
-        # results = model.rerank(RerankRequest(query=query, passages=passages))
-        return []
+        if not documents or top_k <= 0:
+            return []
+        try:
+            from flashrank import Ranker, RerankRequest
+            if self._model is None:
+                self._model = Ranker()
+            response = self._model.rerank(RerankRequest(query=query, passages=[{"text": d.get("text", "")} for d in documents]))
+            by_text = {document.get("text", ""): document for document in documents}
+            return [RerankResult(item["text"], float(by_text[item["text"]].get("score", 0.0)),
+                                 float(item["score"]), dict(by_text[item["text"]].get("metadata", {})), rank)
+                    for rank, item in enumerate(response[:top_k])]
+        except Exception:
+            return CrossEncoderReranker._fallback_to_results(query, documents, top_k)
+
+
+def _fallback_to_results(query: str, documents: list[dict], top_k: int) -> list[RerankResult]:
+    scores = CrossEncoderReranker._fallback_scores(query, documents)
+    ranked = sorted(zip(scores, documents), key=lambda item: item[0], reverse=True)
+    return [RerankResult(doc.get("text", ""), float(doc.get("score", 0.0)), float(score),
+                         dict(doc.get("metadata", {})), index)
+            for index, (score, doc) in enumerate(ranked[:top_k])]
+
+
+# Keep the fallback available to Flashrank without creating a second scoring rule.
+CrossEncoderReranker._fallback_to_results = staticmethod(_fallback_to_results)
 
 
 def benchmark_reranker(reranker, query: str, documents: list[dict], n_runs: int = 5) -> dict:
-    """Benchmark latency over n_runs. (Đã implement sẵn)"""
+    if n_runs <= 0:
+        raise ValueError("n_runs must be positive")
     times = []
     for _ in range(n_runs):
         start = time.perf_counter()
         reranker.rerank(query, documents)
-        elapsed = (time.perf_counter() - start) * 1000
-        times.append(elapsed)
+        times.append((time.perf_counter() - start) * 1000)
     return {"avg_ms": sum(times) / len(times), "min_ms": min(times), "max_ms": max(times)}
-
-
-if __name__ == "__main__":
-    query = "Nhân viên được nghỉ phép bao nhiêu ngày?"
-    docs = [
-        {"text": "Nhân viên được nghỉ 12 ngày/năm.", "score": 0.8, "metadata": {}},
-        {"text": "Mật khẩu thay đổi mỗi 90 ngày.", "score": 0.7, "metadata": {}},
-        {"text": "Thời gian thử việc là 60 ngày.", "score": 0.75, "metadata": {}},
-    ]
-    reranker = CrossEncoderReranker()
-    for r in reranker.rerank(query, docs):
-        print(f"[{r.rank}] {r.rerank_score:.4f} | {r.text}")
